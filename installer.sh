@@ -7,12 +7,12 @@ echo "== Dossier de la caisse jetons : $DIR"
 
 echo "== Paquets système"
 sudo apt update
-sudo apt install -y python3-venv python3-pip
+sudo apt install -y python3-venv python3-pip git
 
 echo "== Environnement Python"
 python3 -m venv "$DIR/venv"
 "$DIR/venv/bin/pip" install --upgrade pip
-"$DIR/venv/bin/pip" install flask python-escpos pyusb pyserial "qrcode[pil]"
+"$DIR/venv/bin/pip" install -r "$DIR/requirements.txt"
 
 echo "== Imprimante tickets USB (0416:5011) et module tiroir (067b:23a3) : droits d'accès"
 # (déjà fait si la caisse bar est installée : on le refait sans risque)

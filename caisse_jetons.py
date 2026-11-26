@@ -25,13 +25,39 @@ except Exception:
 # CONFIG
 # =========================================================
 
+VERSION = "1.2.0"          # à augmenter à chaque mise à jour publiée sur GitHub
+
 app = Flask(__name__)
-app.secret_key = "change_moi_jetons"
 
 PORT = 5001
 URL_CAISSE = f"http://127.0.0.1:{PORT}"
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+
+
+def charger_cle_secrete():
+    """Clé secrète propre à chaque caisse, créée au premier démarrage (jamais dans le dépôt Git)."""
+    import secrets
+    chemin = os.path.join(BASE_DIR, "secret_key.txt")
+    try:
+        with open(chemin, encoding="utf-8") as f:
+            cle = f.read().strip()
+        if len(cle) >= 32:
+            return cle
+    except OSError:
+        pass
+    cle = secrets.token_hex(32)
+    with open(chemin, "w", encoding="utf-8") as f:
+        f.write(cle)
+    try:
+        os.chmod(chemin, 0o600)
+    except OSError:
+        pass
+    return cle
+
+
+app.secret_key = charger_cle_secrete()
+
 DB_FILE = os.path.join(BASE_DIR, "caisse_jetons.db")
 PASSWORD_FILE = os.path.join(BASE_DIR, "password.txt")
 BACKUP_DIR = os.path.join(BASE_DIR, "backup")
@@ -375,6 +401,7 @@ def _imprimer_bilan(printer, r):
     p("RAPPORT Z\n")
     printer.set(align="center", bold=False, width=1, height=1)
     p("VENTE DE JETONS\n")
+    p(f"Caisse jetons v{VERSION}\n")
     p(f"{r['nom']}\n")
     p(datetime.now().strftime("%d/%m/%Y %H:%M:%S") + "\n")
     p(sep)
@@ -1205,7 +1232,7 @@ def config():
     p = {cle: get_param(cle) for cle in DEFAUTS}
     return render_template_string("""
     {{ style|safe }}
-    <header>CONFIGURATION — VENTE DE JETONS</header>
+    <header>CONFIGURATION — VENTE DE JETONS<span style="position:absolute;right:20px;top:50%;transform:translateY(-50%);font-size:18px;font-weight:normal;color:#aaa;">version {{ version }}</span></header>
     <div style="padding:20px;text-align:center;">
         <div class="card">
             <h2>📋 Paramètres</h2>
@@ -1277,6 +1304,16 @@ def config():
             {% if erreur_journal %}<p style="color:#ff5555;">Dernière erreur imprimante : {{ erreur_journal }}</p>{% endif %}
         </div>
 
+        <div class="card">
+            <h2>🔄 Mise à jour</h2>
+            <p style="font-size:22px;">Version installée : <b>{{ version }}</b></p>
+            <a class="btn blue" href="/maj">Vérifier les mises à jour</a>
+            <form method="post" action="/redemarrer_pos" style="display:inline;"
+                  onsubmit="return confirm('Redémarrer complètement le POS ?');">
+                <button class="btn gray">⟳ Redémarrer le POS</button>
+            </form>
+        </div>
+
         <a class="btn blue" href="/ventes">Historique ventes</a><br>
         <a class="btn green" href="/stats">Statistiques</a><br>
         <a class="btn green" href="/fin_service">Rapport Z + impression</a><br>
@@ -1300,7 +1337,7 @@ def config():
             </script>
         </div>
     </div>
-    """, style=STYLE, p=p, r=resume_ventes(),
+    """, style=STYLE, version=VERSION, p=p, r=resume_ventes(),
         bancontact=option_active("pay_bancontact"), carte=option_active("pay_carte"),
         journal=journal_actif(), qr_ok=qrcode is not None, erreur_journal=ERREUR_JOURNAL["texte"],
         tiroir_ok=tiroir_configure(), tiroir_libelle=libelle_tiroir(),
@@ -1473,6 +1510,197 @@ def fermer_fenetre():
     <header>FERMETURE…</header>
     <div style="padding:60px;text-align:center;font-size:30px;">Fermeture de la fenêtre…</div>
     """, style=STYLE)
+
+# =========================================================
+# MISE À JOUR DEPUIS GITHUB
+# =========================================================
+
+def git(*args, timeout=30):
+    """Lance une commande git dans le dossier de la caisse. Retourne (ok, sortie)."""
+    try:
+        r = subprocess.run(["git", *args], cwd=BASE_DIR, capture_output=True, text=True, timeout=timeout)
+        return r.returncode == 0, (r.stdout + r.stderr).strip()
+    except FileNotFoundError:
+        return False, "git n'est pas installé (sudo apt install git)"
+    except subprocess.TimeoutExpired:
+        return False, "Délai dépassé (pas d'Internet ?)"
+
+
+def version_dans(texte):
+    import re
+    m = re.search(r'^VERSION\s*=\s*"([^"]+)"', texte or "", re.M)
+    return m.group(1) if m else "?"
+
+
+def etat_mise_a_jour():
+    """Interroge GitHub et compare avec la version installée."""
+    if not os.path.isdir(os.path.join(BASE_DIR, ".git")):
+        return {"erreur": "Cette caisse n'a pas été installée depuis GitHub (pas de dossier .git)."}
+    ok, sortie = git("fetch", "--quiet", "origin")
+    if not ok:
+        return {"erreur": "Impossible de joindre GitHub : " + sortie}
+    ok, branche = git("rev-parse", "--abbrev-ref", "HEAD")
+    branche = branche if ok and branche != "HEAD" else "main"
+    distant = f"origin/{branche}"
+    ok, nb = git("rev-list", "--count", f"HEAD..{distant}")
+    if not ok:
+        return {"erreur": nb}
+    nb = int(nb or 0)
+    _, code_distant = git("show", f"{distant}:caisse_jetons.py")
+    _, journal = git("log", "--pretty=format:%s", f"HEAD..{distant}")
+    _, modifies = git("status", "--porcelain", "--untracked-files=no")
+    return {
+        "erreur": "",
+        "branche": branche,
+        "nb": nb,
+        "version_distante": version_dans(code_distant),
+        "changements": [l for l in journal.splitlines() if l.strip()],
+        "fichiers_modifies": [l for l in modifies.splitlines() if l.strip()],
+    }
+
+
+def redemarrer_caisse_plus_tard():
+    """Relance le programme de la caisse. La fenêtre Firefox reste ouverte et se recharge toute seule.
+
+    Un nouveau processus démarre 2 s après l'arrêt de celui-ci (le port 5001 doit être libéré).
+    """
+    time.sleep(1.5)
+    with IMPRIMANTE_LOCK:              # attend la fin d'une impression en cours
+        pass
+    script = os.path.join(BASE_DIR, "caisse_jetons.py")
+    log = os.path.join(BASE_DIR, "caisse_jetons.log")
+    if os.name == "nt":
+        subprocess.Popen([sys.executable, script, "--sans-navigateur"], cwd=BASE_DIR,
+                         creationflags=0x00000008 | 0x00000200)   # DETACHED_PROCESS | NEW_PROCESS_GROUP
+    else:
+        commande = f'sleep 2; exec "{sys.executable}" "{script}" --sans-navigateur >> "{log}" 2>&1'
+        subprocess.Popen(["/bin/sh", "-c", commande], cwd=BASE_DIR,
+                         start_new_session=True, close_fds=True,
+                         stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    os._exit(0)
+
+
+@app.route("/version")
+def route_version():
+    return {"version": VERSION}
+
+
+@app.route("/maj")
+def maj():
+    if not admin_required():
+        return redirect(url_for("login"))
+    e = etat_mise_a_jour()
+    return render_template_string("""
+    {{ style|safe }}
+    <header>MISE À JOUR</header>
+    <div style="padding:20px;text-align:center;">
+        <div class="card">
+            <p style="font-size:24px;">Version installée : <b>{{ version }}</b></p>
+            {% if e.erreur %}
+                <h2 style="color:#ff5555;">✖ {{ e.erreur }}</h2>
+            {% elif e.nb == 0 %}
+                <h2 style="color:#00ff66;">✔ La caisse est à jour</h2>
+            {% else %}
+                <h2 style="color:#f1c40f;">Nouvelle version disponible : {{ e.version_distante }}</h2>
+                <div style="text-align:left;max-width:800px;margin:auto;font-size:20px;">
+                    <b>Changements :</b>
+                    <ul>{% for c in e.changements %}<li>{{ c }}</li>{% endfor %}</ul>
+                </div>
+                {% if e.fichiers_modifies %}
+                <p style="color:#ff5555;font-size:20px;">Des fichiers du programme ont été modifiés à la main sur ce POS :
+                {{ e.fichiers_modifies|join(', ') }}. La mise à jour risque d'échouer.</p>
+                {% endif %}
+                <form method="post" action="/maj/installer"
+                      onsubmit="return confirm('Installer la version {{ e.version_distante }} et redémarrer la caisse ?');">
+                    <button class="btn green" style="font-size:30px;padding:24px 40px;">Installer et redémarrer la caisse</button>
+                </form>
+            {% endif %}
+        </div>
+        <a class="btn gray" href="/config">Retour</a>
+    </div>
+    """, style=STYLE, version=VERSION, e=e)
+
+
+@app.route("/maj/installer", methods=["POST"])
+def maj_installer():
+    if not admin_required():
+        return redirect(url_for("login"))
+    e = etat_mise_a_jour()
+    if e.get("erreur") or e.get("nb", 0) == 0:
+        return redirect(url_for("maj"))
+
+    _, fichiers = git("diff", "--name-only", f"HEAD..origin/{e['branche']}")
+    ok, sortie = git("merge", "--ff-only", f"origin/{e['branche']}")
+    if not ok:
+        return render_template_string("""
+        {{ style|safe }}<header>MISE À JOUR</header>
+        <div style="padding:20px;text-align:center;"><div class="card">
+            <h2 style="color:#ff5555;">✖ La mise à jour a échoué</h2>
+            <pre style="text-align:left;white-space:pre-wrap;font-size:18px;">{{ sortie }}</pre>
+        </div><a class="btn gray" href="/config">Retour</a></div>
+        """, style=STYLE, sortie=sortie)
+
+    # nouvelles dépendances Python éventuelles
+    if "requirements.txt" in fichiers.split():
+        try:
+            subprocess.run([sys.executable, "-m", "pip", "install", "-q", "-r",
+                            os.path.join(BASE_DIR, "requirements.txt")], timeout=600)
+        except Exception as ex:
+            print("pip :", ex)
+
+    if journal_actif():
+        imprimer_journal([
+            "*** JETONS MISE A JOUR ***",
+            datetime.now().strftime("%d/%m/%Y %H:%M:%S"),
+            f"v{VERSION} -> v{e['version_distante']}",
+            "-" * 32,
+        ])
+    backup_db()
+    session["admin"] = False
+    threading.Thread(target=redemarrer_caisse_plus_tard, daemon=True).start()
+    return render_template_string("""
+    {{ style|safe }}<header>MISE À JOUR</header>
+    <div style="padding:60px;text-align:center;">
+        <h1 style="color:#00ff66;">✔ Version {{ nouvelle }} installée</h1>
+        <p id="etat" style="font-size:28px;">Redémarrage de la caisse…</p>
+    </div>
+    <script>
+    setTimeout(function attendre() {
+        fetch("/version", {cache: "no-store"})
+            .then(r => r.json())
+            .then(d => { if (d.version === "{{ nouvelle }}") location.href = "/"; else setTimeout(attendre, 1000); })
+            .catch(() => setTimeout(attendre, 1000));
+    }, 2500);
+    </script>
+    """, style=STYLE, nouvelle=e["version_distante"])
+
+
+@app.route("/redemarrer_pos", methods=["POST"])
+def redemarrer_pos():
+    if not admin_required():
+        return redirect(url_for("login"))
+    if journal_actif():
+        imprimer_journal(["*** JETONS REDEMARRAGE POS ***",
+                          datetime.now().strftime("%d/%m/%Y %H:%M:%S"), "-" * 32])
+    backup_db()
+
+    def plus_tard():
+        time.sleep(2)
+        for cmd in (["systemctl", "reboot"], ["sudo", "-n", "reboot"]):
+            try:
+                if subprocess.run(cmd, timeout=10).returncode == 0:
+                    return
+            except Exception:
+                continue
+        print("Redémarrage du POS refusé par le système")
+
+    threading.Thread(target=plus_tard, daemon=True).start()
+    return render_template_string("""
+    {{ style|safe }}<header>REDÉMARRAGE</header>
+    <div style="padding:60px;text-align:center;font-size:30px;">Redémarrage du POS…<br>
+    <span style="font-size:20px;color:#aaa;">Si rien ne se passe dans 30 secondes, le système a refusé : redémarrez avec le bouton marche/arrêt.</span></div>
+    """, style=STYLE)
+
 
 # =========================================================
 # ADMIN : HISTORIQUE / STATS / RAPPORT Z
@@ -1672,6 +1900,7 @@ def reset():
 # =========================================================
 
 if __name__ == "__main__":
+    print(f"Caisse jetons version {VERSION}")
     init_db()
     read_password()
     try:

@@ -1,8 +1,12 @@
-# Données locales du POS : ne jamais les publier
-*.db
+# Données propres à chaque caisse : ne jamais les publier
+caisse_jetons.db
 password.txt
+secret_key.txt
 config.json
 backup/
 *.log
+
+# Environnement Python
 venv/
 __pycache__/
+*.pyc

@@ -1,0 +1,5 @@
+flask
+python-escpos
+pyusb
+pyserial
+qrcode[pil]
